@@ -1,5 +1,5 @@
 """
-Napon belüli + swing jelzés-figyelő bot -> Telegram értesítés a telefonra.
+Napon belüli + swing, többidősíkos jelzés-figyelő bot -> Telegram értesítés a telefonra.
 NEM köt ügyletet, csak jelez. A döntés a tiéd.
 
 Tartalma: EMA 9/21/200, RSI, trend, kitörés, gyertyaformációk,
@@ -36,12 +36,26 @@ SYMBOLS = {                              # név -> Yahoo ticker
     "EURHUF": "EURHUF=X",
 }
 CHECK_EVERY = 120       # másodperc két ellenőrzés között (csak folyamatos módban)
-USE_SWING = True        # swing jelzések (napi gyertyán) be/ki
-TIMEFRAMES = [
-    {"interval": "15m", "label": "NAPON BELÜLI", "min": 15, "period": "30d", "atr_mult": 1.5, "rr": 2.0, "news": True},
-    {"interval": "1d", "label": "SWING", "min": 1440, "period": "1y", "atr_mult": 2.0, "rr": 3.0, "news": False},
+USE_SWING = True        # swing jelzések be/ki
+
+# Idősíkok. A "4h" az órás adatból készül (a Yahoo nem ad 4 órásat).
+TF = {
+    "1mo": {"label": "MN", "yf": "1mo", "period": "max", "min": 43200},
+    "1wk": {"label": "W1", "yf": "1wk", "period": "10y", "min": 10080},
+    "1d":  {"label": "D1", "yf": "1d", "period": "2y", "min": 1440},
+    "4h":  {"label": "H4", "yf": "1h", "period": "180d", "min": 240, "resample": "4h"},
+    "1h":  {"label": "H1", "yf": "1h", "period": "180d", "min": 60},
+    "15m": {"label": "M15", "yf": "15m", "period": "30d", "min": 15},
+}
+TF_ORDER = ["1mo", "1wk", "1d", "4h", "1h", "15m"]       # fentről lefelé
+REFRESH_MIN = {"1mo": 1440, "1wk": 720, "1d": 180, "4h": 20, "1h": 20, "15m": 0}   # ennyi percenként tölti újra
+# entry = ezen az idősíkon keres belépőt; context = ezek trendje erősíti meg (min_align db-nak egyeznie kell)
+MODES = [
+    {"name": "NAPON BELÜLI", "entry": "15m", "context": ["1d", "4h", "1h"],
+     "atr_mult": 1.5, "rr": 2.0, "news": True, "min_align": 2},
+    {"name": "SWING", "entry": "4h", "context": ["1mo", "1wk", "1d"],
+     "atr_mult": 2.0, "rr": 3.0, "news": False, "min_align": 2},
 ]
-INTERVAL = "15m"       # az állapotjelentés idősíkja
 LOCAL_TZ = ZoneInfo("Europe/Budapest")
 
 # Gazdasági naptár
@@ -61,6 +75,8 @@ sent = {}
 warned = {}
 state = {"brief_date": None, "overview_t": None}
 last_info = {}
+fetched = {}
+ctx = {}
 cal_cache = {"t": None, "events": []}
 
 
@@ -310,35 +326,65 @@ def analyze(df, tf):
     return out
 
 
-def format_msg(name, s, tf):
+ARROW = {"bull": "↑", "bear": "↓", "mixed": "→"}
+
+
+def ctx_trend(df):
+    """Trend az utolsó LEZÁRT gyertyán: EMA9 > EMA21 > lassú EMA. Rövid előzménynél EMA50 az EMA200 helyett."""
+    if len(df) < 30:
+        return None
+    c = df["Close"]
+    slow = 200 if len(df) >= 250 else 50
+    e9 = c.ewm(span=9, adjust=False).mean().iloc[-2]
+    e21 = c.ewm(span=21, adjust=False).mean().iloc[-2]
+    es = c.ewm(span=slow, adjust=False).mean().iloc[-2]
+    p = c.iloc[-2]
+    if e9 > e21 > es and p > e21:
+        return "bull"
+    if e9 < e21 < es and p < e21:
+        return "bear"
+    return "mixed"
+
+
+def ctx_line(name, mode, side):
+    parts, ok = [], 0
+    for k in mode["context"]:
+        t = ctx.get(f"{name}|{k}")
+        parts.append(f"{TF[k]['label']} {ARROW.get(t, '?')}")
+        if t == side:
+            ok += 1
+    return " | ".join(parts), ok
+
+
+def format_msg(name, s, mode, tfc, ctx_text, ok):
     side = "LONG (vétel)" if s["side"] == "bull" else "SHORT (eladás)"
     late = ""
     if abs(s["dist_atr"]) > 0.5:
         late = "\nFIGYELEM: az ár már messze van a belépőtől, valószínűleg elkésett."
     trend_line = TREND_TXT[s["trend"]] + (" (trenddel egyező)" if s["aligned"] else " (ELLENTREND, óvatosan)")
-    if tf["min"] >= 1440:
-        candle = f"Lezárt napi gyertya: {loc(s['candle']).strftime('%Y-%m-%d')}"
-        extra = "\nSwing: napokig/hetekig tartó pozíció, a stop és a cél szélesebb."
+    if tfc["min"] >= 1440:
+        candle = f"Lezárt gyertya: {loc(s['candle']).strftime('%Y-%m-%d')}"
     else:
         open_t = loc(s["candle"])
-        close_t = open_t + pd.Timedelta(minutes=tf["min"])
+        close_t = open_t + pd.Timedelta(minutes=tfc["min"])
         candle = f"Lezárt gyertya: {open_t.strftime('%H:%M')}-{close_t.strftime('%H:%M')} (magyar idő)"
-        extra = ""
-    return (f"{name} [{tf['label']} {tf['interval']}] - {side}\n"
+    extra = "\nSwing: napokig/hetekig tartó pozíció, a stop és a cél szélesebb." if mode["name"] == "SWING" else ""
+    return (f"{name} [{mode['name']} {tfc['label']}] - {side}\n"
             f"Jelek ({len(s['reasons'])}): " + ", ".join(s["reasons"]) + "\n"
-            f"Trend: {trend_line}\n"
+            f"Trend ({tfc['label']}): {trend_line}\n"
+            f"Idősíkok: {ctx_text} -> {ok}/{len(mode['context'])} egyezik\n"
             f"Belépő ~ {s['entry']:.5g}\n"
             f"Aktuális ár ~ {s['cur']:.5g}\n"
             f"Stop ~ {s['stop']:.5g}\n"
-            f"Cél ~ {s['target']:.5g} (1:{tf['rr']:g})\n"
+            f"Cél ~ {s['target']:.5g} (1:{mode['rr']:g})\n"
             + candle
             + (f"\nMegjegyzés: {', '.join(s['notes'])}" if s["notes"] else "")
             + extra + late +
             "\nEz csak jelzés, nem tanács. Ellenőrizd a grafikont az XTB-ben!")
 
 
-def fetch(ticker, tf):
-    df = yf.download(ticker, period=tf["period"], interval=tf["interval"], progress=False, auto_adjust=True)
+def fetch_raw(ticker, yf_interval, period):
+    df = yf.download(ticker, period=period, interval=yf_interval, progress=False, auto_adjust=True)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     if df.empty:
@@ -350,6 +396,20 @@ def fetch(ticker, tf):
     return df
 
 
+def get_frame(tfk, ticker, raw):
+    cfg = TF[tfk]
+    key = (ticker, cfg["yf"], cfg["period"])
+    if key not in raw:
+        raw[key] = fetch_raw(ticker, cfg["yf"], cfg["period"])
+    df = raw[key]
+    if df is None or df.empty:
+        return None
+    if cfg.get("resample"):
+        df = df.resample(cfg["resample"], origin="start_day").agg(
+            {"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+    return df
+
+
 def overview(now):
     if OVERVIEW_EVERY_MIN <= 0 or not last_info:
         return
@@ -357,46 +417,75 @@ def overview(now):
     if t is not None and (now - t).total_seconds() < OVERVIEW_EVERY_MIN * 60:
         return
     state["overview_t"] = now
-    ic = {"bull": "LONG irány", "bear": "SHORT irány", "mixed": "nincs tiszta irány"}
-    lines = [f"{n}: {ic[v[0]]} | RSI {v[1]:.0f} | ár ~ {v[2]:.5g}" for n, v in last_info.items()]
-    telegram(f"Állapot ({loc(now).strftime('%H:%M')}, {INTERVAL}):\n" + "\n".join(lines)
-             + "\n(Az irány a trendből jön, belépőt csak külön jelzés ad.)")
+    lines = []
+    for n in SYMBOLS:
+        if n not in last_info:
+            continue
+        rsi, price, stale = last_info[n]
+        arrows = " ".join(f"{TF[k]['label']}{ARROW.get(ctx.get(f'{n}|{k}'), '?')}" for k in TF_ORDER)
+        lines.append(f"{n}: {arrows} | RSI {rsi:.0f} | ár ~ {price:.5g}" + (" (zárva)" if stale else ""))
+    telegram(f"Állapot ({loc(now).strftime('%H:%M')}):\n" + "\n".join(lines)
+             + "\n(↑ emelkedő, ↓ csökkenő, → vegyes. Az RSI az M15-ös. Belépőt csak külön jelzés ad.)")
 
 
 def run_once():
     now = pd.Timestamp.now(tz="UTC")
     calendar_messages(now)
-    for tf in TIMEFRAMES:
-        if tf["min"] >= 1440 and not USE_SWING:
-            continue
-        for name, ticker in SYMBOLS.items():
-            try:
-                if tf["news"]:
+    modes = [m for m in MODES if USE_SWING or m["name"] != "SWING"]
+    needed = set()
+    for m in modes:
+        needed.add(m["entry"])
+        needed.update(m["context"])
+    order = [k for k in TF_ORDER if k in needed]
+    for name, ticker in SYMBOLS.items():
+        try:
+            raw, frames = {}, {}
+            for tfk in order:                                  # fentről lefelé: előbb a kontextus
+                lf = fetched.get(f"{name}|{tfk}")
+                age = (now - pd.Timestamp(lf)).total_seconds() / 60 if lf else 1e9
+                if age < REFRESH_MIN[tfk]:
+                    continue
+                df = get_frame(tfk, ticker, raw)
+                if df is None or len(df) < 30:
+                    continue
+                fetched[f"{name}|{tfk}"] = str(now)
+                frames[tfk] = df
+                t = ctx_trend(df)
+                if t:
+                    ctx[f"{name}|{tfk}"] = t
+                if tfk == "15m":
+                    d_ = add_indicators(df).dropna()
+                    if len(d_) > 2:
+                        stale = now - (df.index[-2] + pd.Timedelta(minutes=15)) > pd.Timedelta(minutes=45)
+                        last_info[name] = (float(d_.iloc[-2].rsi), float(d_.iloc[-1].Close), bool(stale))
+            for mode in modes:
+                e = mode["entry"]
+                if e not in frames:
+                    continue
+                tfc = TF[e]
+                if mode["news"]:
                     why = blackout_reason(name, now)
                     if why:
                         print(name, "hírtilalom:", why)
                         continue
-                df = fetch(ticker, tf)
-                if df.empty or len(df) < 40:
-                    continue
-                closed_at = df.index[-2] + pd.Timedelta(minutes=tf["min"])
-                if now - closed_at > pd.Timedelta(minutes=3 * tf["min"]):
-                    continue              # zárva a piac / régi adat
-                if tf["interval"] == INTERVAL:
-                    d_ = add_indicators(df).dropna()
-                    if len(d_) > 2:
-                        r_ = d_.iloc[-2]
-                        last_info[name] = (trend_of(r_), float(r_.rsi), float(d_.iloc[-1].Close))
-                for s in analyze(df, tf):
-                    key = f"{name}|{tf['interval']}|{s['candle']}|{s['side']}"
+                df = frames[e]
+                closed_at = df.index[-2] + pd.Timedelta(minutes=tfc["min"])
+                win = 3 * tfc["min"] if tfc["min"] <= 15 else 2 * tfc["min"]
+                if now - closed_at > pd.Timedelta(minutes=win):
+                    continue                                   # zárva a piac / régi adat
+                for s in analyze(df, mode):
+                    ctx_text, ok = ctx_line(name, mode, s["side"])
+                    if ok < mode["min_align"]:
+                        continue                               # a magasabb idősíkok nem erősítik meg
+                    key = f"{name}|{mode['name']}|{e}|{s['candle']}|{s['side']}"
                     if key in sent:
                         continue
                     sent[key] = 1
-                    msg = format_msg(name, s, tf)
+                    msg = format_msg(name, s, mode, tfc, ctx_text, ok)
                     print(msg)
                     telegram(msg)
-            except Exception as e:
-                print(name, tf["interval"], "hiba:", e)
+        except Exception as ex:
+            print(name, "hiba:", ex)
     overview(now)
 
 
@@ -410,6 +499,8 @@ def load_state():
         sent[k] = 1
     for k in d.get("warned", []):
         warned[k] = 1
+    fetched.update(d.get("fetched", {}))
+    ctx.update(d.get("ctx", {}))
     state["brief_date"] = d.get("brief_date")
     if d.get("overview_t"):
         state["overview_t"] = pd.Timestamp(d["overview_t"])
@@ -424,6 +515,8 @@ def save_state():
     d = {
         "sent": list(sent)[-400:],
         "warned": list(warned)[-200:],
+        "fetched": fetched,
+        "ctx": ctx,
         "brief_date": state["brief_date"],
         "overview_t": str(state["overview_t"]) if state["overview_t"] is not None else None,
         "cal": {"t": str(cal_cache["t"]),
