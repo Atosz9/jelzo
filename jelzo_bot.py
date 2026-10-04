@@ -80,6 +80,9 @@ BRIEF_HOUR = 7                  # napi összefoglaló ekkortól (magyar idő)
 CUR_SYMBOLS = {"EUR": ["GER40", "EURHUF"], "HUF": ["USDHUF", "EURHUF"]}   # USD mindent érint
 OVERVIEW_EVERY_MIN = 60         # óránként állapotjelentés minden eszközről (0 = ki)
 SKIP_SATURDAY = True            # szombaton nincs üzenet (a WEEKEND_SYMBOLS kivételével)
+INTRADAY_EXPIRE_DAYS = 2        # eredménykövetés: napon belüli jelzés ennyi nap után "lejárt"
+SWING_EXPIRE_DAYS = 21          # swing jelzés ennyi nap után "lejárt"
+SIGNAL_KEEP_DAYS = 35           # ennyi napig őrzi a jelzéseket a heti összesítőhöz
 WEEKEND_SYMBOLS = ["BTC"]       # ezekre hétvégén (szombat, vasárnap a nyitásig) is jön jelzés
 SUNDAY_OUTLOOK_HOUR = 18        # vasárnap ekkortól (magyar idő) jön a heti kép és a jövő heti naptár
 SUNDAY_RESUME_HOUR = 21         # vasárnap ekkortól indul a normál működés (a forex/arany kb. 23:00-kor nyit)
@@ -90,6 +93,7 @@ sent = {}
 warned = {}
 state = {"brief_date": None, "overview_t": None, "outlook_date": None}
 last_info = {}
+signals = []
 fetched = {}
 ctx = {}
 cal_cache = {"t": None, "events": []}
@@ -730,6 +734,7 @@ def weekly_outlook(now):
     if state["outlook_date"] == str(lt.date()) or lt.hour < SUNDAY_OUTLOOK_HOUR:
         return
     state["outlook_date"] = str(lt.date())
+    send_long(weekly_review(now))
     if USE_CALENDAR:
         cal_cache["t"] = None
         events = load_calendar()
@@ -762,6 +767,127 @@ def weekly_outlook(now):
                   + "\n\n<i>↑ emelkedő · ↓ csökkenő · → vegyes. Az átlagos heti mozgás a 14 hetes ATR."
                   + " Forex és arany kb. 23:00-kor nyit (magyar idő), a normál jelzések ekkortól indulnak."
                   + " Hétfőn 7:00 után jön a napi hírösszefoglaló.</i>")
+
+
+def record_signal(name, mode, tfc, s):
+    """Elmenti a kiküldött jelzést az utólagos eredménykövetéshez."""
+    t_close = s["candle"] + pd.Timedelta(minutes=tfc["min"])
+    signals.append({"name": name, "mode": mode["name"], "tf": tfc["label"], "side": s["side"],
+                    "t": str(t_close), "entry": float(s["entry"]), "stop": float(s["stop"]),
+                    "target": float(s["target"]), "rr": mode["rr"], "reasons": list(s["reasons"]),
+                    "aligned": bool(s["aligned"]), "status": "open", "outcome": None, "r": None, "resolved": None})
+
+
+def resolve_signals(name, df15, now):
+    """A nyitott jelzéseket a jelzés utáni 15 perces gyertyákon kiértékeli: cél, stop vagy lejárat.
+    Ha egy gyertyában a stop és a cél is érintve van, óvatosan stopnak számít."""
+    if df15 is None or df15.empty:
+        return
+    for sg in signals:
+        if sg["name"] != name or sg["status"] != "open":
+            continue
+        t0 = pd.Timestamp(sg["t"])
+        sub = df15[df15.index >= t0]
+        long_ = sg["side"] == "bull"
+        out = None
+        for ts, c in sub.iterrows():
+            hit_stop = c.Low <= sg["stop"] if long_ else c.High >= sg["stop"]
+            hit_tgt = c.High >= sg["target"] if long_ else c.Low <= sg["target"]
+            if hit_stop:
+                out = ("stop", -1.0, ts)
+                break
+            if hit_tgt:
+                out = ("target", float(sg["rr"]), ts)
+                break
+        if out:
+            sg.update(status="closed", outcome=out[0], r=out[1], resolved=str(out[2]))
+            continue
+        limit = SWING_EXPIRE_DAYS if sg["mode"] == "SWING" else INTRADAY_EXPIRE_DAYS
+        if (now - t0).total_seconds() / 86400 >= limit:
+            risk = abs(sg["entry"] - sg["stop"]) or 1e-9
+            last = float(df15.Close.iloc[-1])
+            r = (last - sg["entry"]) / risk if long_ else (sg["entry"] - last) / risk
+            sg.update(status="closed", outcome="expired", r=round(r, 2), resolved=str(now))
+
+
+def summarize(sgs):
+    closed = [x for x in sgs if x["status"] == "closed"]
+    wins = [x for x in closed if x["outcome"] == "target"]
+    losses = [x for x in closed if x["outcome"] == "stop"]
+    dec = len(wins) + len(losses)
+    return {"n": len(sgs), "closed": len(closed), "open": len(sgs) - len(closed), "wins": len(wins),
+            "losses": len(losses), "exp": len(closed) - dec, "hit": (len(wins) / dec * 100) if dec else None,
+            "tot": sum(x["r"] for x in closed)}
+
+
+def stat_line(label, sgs):
+    m = summarize(sgs)
+    if not m["closed"]:
+        return f"  {esc(label)}: {m['n']} jelzés · mind nyitott"
+    hit = f"{m['hit']:.0f}%" if m["hit"] is not None else "-"
+    return f"  {esc(label)}: {m['n']} jelzés · találat {hit} · {m['tot']:+.1f}R"
+
+
+def weekly_review(now):
+    wk = [x for x in signals if pd.Timestamp(x["t"]) >= now - pd.Timedelta(days=7)]
+    head = "📈 <b>Heti eredmény-összesítő</b> (elmúlt 7 nap)\n"
+    if not wk:
+        return head + "\nAz elmúlt 7 napban nem volt jelzés."
+    m = summarize(wk)
+    t = head + ("<i>Szimulált eredmény: belépő = a jelzés záróára, a stop és a cél a gyertyák csúcsa/mélypontja alapján. "
+                "Nem valós ügylet, a költségeket (spread) nem tartalmazza. Az R a kockázat egysége: -1R = stop, +2R vagy +3R = cél.</i>\n\n")
+    t += f"Jelzések: {m['n']} · lezárt: {m['closed']} · nyitott: {m['open']}\n"
+    t += f"✅ Cél: {m['wins']} · ❌ Stop: {m['losses']} · ⌛ Lejárt: {m['exp']}\n"
+    if m["hit"] is not None:
+        t += f"Találati arány: {m['hit']:.0f}% · összesen: {m['tot']:+.1f}R"
+        if m["closed"]:
+            t += f" · átlag: {m['tot'] / m['closed']:+.2f}R"
+        t += "\n"
+    t += "\n<b>Módonként</b>\n"
+    for md in ("NAPON BELÜLI", "SWING"):
+        g = [x for x in wk if x["mode"] == md]
+        if g:
+            t += stat_line(md.capitalize(), g) + "\n"
+    t += "\n<b>Irány szerint</b>\n"
+    for sd, lb in (("bull", "LONG"), ("bear", "SHORT")):
+        g = [x for x in wk if x["side"] == sd]
+        if g:
+            t += stat_line(lb, g) + "\n"
+    names = sorted({x["name"] for x in wk})
+    rows = []
+    for n in names:
+        g = [x for x in wk if x["name"] == n]
+        rows.append((summarize(g)["tot"], n, g))
+    t += "\n<b>Eszközönként</b> (legjobbtól)\n"
+    for _, n, g in sorted(rows, key=lambda r: -r[0]):
+        t += stat_line(n, g) + "\n"
+    by = {}
+    for x in wk:
+        if x["status"] != "closed":
+            continue
+        for r in x["reasons"]:
+            k = re.sub(r"\s*\(.*?\)", "", r)
+            k = re.sub(r"\s*\d+(\.\d+)?%", "", k).strip()
+            if k.startswith("RSI"):
+                continue
+            by.setdefault(k, []).append(x)
+    rs = [(k, v) for k, v in by.items() if len(v) >= 3]
+    if rs:
+        t += "\n<b>Jelek szerint</b> (min. 3 lezárt jelzés; egy jelzés több jelhez is számít)\n"
+        for k, v in sorted(rs, key=lambda kv: -summarize(kv[1])["tot"]):
+            t += stat_line(k, v) + "\n"
+    closed = [x for x in wk if x["status"] == "closed"]
+    if closed:
+        b = max(closed, key=lambda x: x["r"])
+        w = min(closed, key=lambda x: x["r"])
+        tag = lambda x: f"{esc(x['name'])} {'LONG' if x['side'] == 'bull' else 'SHORT'} {x['r']:+.1f}R"
+        t += f"\n🏆 Legjobb: {tag(b)}\n📉 Legrosszabb: {tag(w)}\n"
+    allm = summarize(signals)
+    if allm["closed"]:
+        hit = f"{allm['hit']:.0f}%" if allm["hit"] is not None else "-"
+        t += (f"\n<i>Az elmúlt ~{SIGNAL_KEEP_DAYS} nap: {allm['closed']} lezárt jelzés · találat {hit} · {allm['tot']:+.1f}R. "
+              "Kevés jelzésnél az arányok nem megbízhatók.</i>")
+    return t
 
 
 def run_once(now=None):
@@ -807,6 +933,7 @@ def run_once(now=None):
                     if len(d_) > 2:
                         stale = now - (df.index[-2] + pd.Timedelta(minutes=15)) > pd.Timedelta(minutes=45)
                         last_info[name] = (float(d_.iloc[-2].rsi), float(d_.iloc[-1].Close), bool(stale))
+            resolve_signals(name, frames.get("15m"), now)
             for mode in modes:
                 e = mode["entry"]
                 if e not in frames:
@@ -833,6 +960,7 @@ def run_once(now=None):
                     msg = format_msg(name, s, mode, tfc, ctx_text, ok)
                     print(msg)
                     telegram(msg)
+                    record_signal(name, mode, tfc, s)
         except Exception as ex:
             print(name, "hiba:", ex)
     if not silent:
@@ -850,6 +978,7 @@ def load_state():
     for k in d.get("warned", []):
         warned[k] = 1
     fetched.update(d.get("fetched", {}))
+    signals[:] = d.get("signals", [])
     ctx.update(d.get("ctx", {}))
     state["brief_date"] = d.get("brief_date")
     state["outlook_date"] = d.get("outlook_date")
@@ -867,6 +996,7 @@ def save_state():
         "sent": list(sent)[-400:],
         "warned": list(warned)[-200:],
         "fetched": fetched,
+        "signals": [x for x in signals if pd.Timestamp(x["t"]) >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=SIGNAL_KEEP_DAYS)],
         "ctx": ctx,
         "brief_date": state["brief_date"],
         "outlook_date": state["outlook_date"],
