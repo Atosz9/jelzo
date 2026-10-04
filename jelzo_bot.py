@@ -11,8 +11,10 @@ Futtatás:   python jelzo_bot.py          (folyamatos)
             python jelzo_bot.py --once   (egy kör, felhős/ütemezett mód)
 """
 import datetime as dt
+import html
 import json
 import os
+import re
 import sys
 import time
 from zoneinfo import ZoneInfo
@@ -87,10 +89,19 @@ ctx = {}
 cal_cache = {"t": None, "events": []}
 
 
+def esc(x):
+    return html.escape(str(x), quote=False)
+
+
 def telegram(text):
+    """HTML formázással küld; ha a Telegram elutasítja, formázás nélkül újrapróbálja."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
+                                     "disable_web_page_preview": True}, timeout=15)
+        if r.status_code != 200:
+            plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": plain}, timeout=15)
     except Exception as e:
         print("Telegram hiba:", e)
 
@@ -146,6 +157,15 @@ def blackout_reason(name, now):
     return None
 
 
+def event_lines(evs):
+    out = []
+    for e in evs:
+        out.append(f'<b>{loc(e["time"]).strftime("%H:%M")}</b> · {esc(e["cur"])} · {esc(e["title"])}')
+        if e["fc"] or e["prev"]:
+            out.append(f'      várt: {esc(e["fc"]) or "-"} · előző: {esc(e["prev"]) or "-"}')
+    return out
+
+
 def calendar_messages(now):
     if not USE_CALENDAR:
         return
@@ -154,21 +174,18 @@ def calendar_messages(now):
     if state["brief_date"] != str(today) and loc(now).weekday() < 5 and loc(now).hour >= BRIEF_HOUR and cal_cache["t"] is not None:
         todays = sorted([e for e in events if loc(e["time"]).date() == today], key=lambda x: x["time"])
         if todays:
-            lines = [f'{loc(e["time"]).strftime("%H:%M")} {e["cur"]} {e["title"]}'
-                     + (f' (várt: {e["fc"]}, előző: {e["prev"]})' if e["fc"] or e["prev"] else "")
-                     for e in todays]
-            telegram("Mai fontos gazdasági hírek (magyar idő):\n" + "\n".join(lines)
-                     + f"\n\nA bot a hírek előtt {BLACKOUT_BEFORE_MIN} és után {BLACKOUT_AFTER_MIN} percig nem jelez.")
+            telegram("📅 <b>Mai fontos gazdasági hírek</b> (magyar idő)\n\n" + "\n".join(event_lines(todays))
+                     + f"\n\n<i>A bot a hírek előtt {BLACKOUT_BEFORE_MIN} és után {BLACKOUT_AFTER_MIN} percig nem jelez.</i>")
         else:
-            telegram("Ma nincs fontos gazdasági hír a naptárban.")
+            telegram("📅 Ma nincs fontos gazdasági hír a naptárban.")
         state["brief_date"] = str(today)
     for e in events:
         m = (e["time"] - now).total_seconds() / 60
         key = f'{e["title"]}|{e["time"]}'
         if 0 < m <= WARN_BEFORE_MIN and key not in warned:
             warned[key] = 1
-            telegram(f'Figyelem: {loc(e["time"]).strftime("%H:%M")} {e["cur"]} {e["title"]} '
-                     f'({int(m)} perc múlva). Nagy mozgás és szélesedő spread jöhet.')
+            telegram(f'⏰ <b>Figyelem!</b> {loc(e["time"]).strftime("%H:%M")} · {esc(e["cur"])} · {esc(e["title"])}\n'
+                     f'{int(m)} perc múlva. Nagy mozgás és szélesedő spread jöhet.')
 
 
 # ---------- Indikátorok ----------
@@ -476,51 +493,55 @@ def ctx_line(name, mode, side):
 
 
 def levels_text(s):
-    """Támasz/ellenállás és Fibonacci sorok az üzenethez."""
+    """Támasz/ellenállás és Fibonacci blokk az üzenethez."""
     t = ""
-    parts = []
-    if s["sup"]:
-        parts.append("támasz " + ", ".join(f"{p:.5g} ({n}x)" for p, n in s["sup"]))
-    if s["res"]:
-        parts.append("ellenállás " + ", ".join(f"{p:.5g} ({n}x)" for p, n in s["res"]))
-    if parts:
-        t += "Szintek: " + " | ".join(parts) + "\n"
+    if s["sup"] or s["res"]:
+        t += "\n<b>Szintek</b>\n"
+        if s["sup"]:
+            t += "  Támasz: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in s["sup"]) + "\n"
+        if s["res"]:
+            t += "  Ellenállás: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in s["res"]) + "\n"
     f = s.get("fib")
     if f:
         r = f["ret"]
-        t += (f"Fibo ({f['low']:.5g}-{f['high']:.5g}): 38.2% {r[0.382]:.5g} | 50% {r[0.5]:.5g} | 61.8% {r[0.618]:.5g}"
-              f" | cél 1.272: {f['ext'][1.272]:.5g}\n")
+        t += (f"\n<b>Fibonacci</b> (hullám: {f['low']:.5g} – {f['high']:.5g})\n"
+              f"  38.2%: {r[0.382]:.5g} · 50%: {r[0.5]:.5g} · 61.8%: {r[0.618]:.5g}\n"
+              f"  Cél (1.272): {f['ext'][1.272]:.5g}\n")
     return t
 
 
 def format_msg(name, s, mode, tfc, ctx_text, ok):
+    icon = "🟢" if s["side"] == "bull" else "🔴"
     side = "LONG (vétel)" if s["side"] == "bull" else "SHORT (eladás)"
-    late = ""
-    if abs(s["dist_atr"]) > 0.5:
-        late = "\nFIGYELEM: az ár már messze van a belépőtől, valószínűleg elkésett."
-    trend_line = TREND_TXT[s["trend"]] + (" (trenddel egyező)" if s["aligned"] else " (ELLENTREND, óvatosan)")
+    trend_line = TREND_TXT[s["trend"]] + (" ✓ trenddel egyező" if s["aligned"] else " ⚠️ ELLENTREND, óvatosan")
     if tfc["min"] >= 1440:
         candle = f"Lezárt gyertya: {loc(s['candle']).strftime('%Y-%m-%d')}"
     else:
         open_t = loc(s["candle"])
         close_t = open_t + pd.Timedelta(minutes=tfc["min"])
-        candle = f"Lezárt gyertya: {open_t.strftime('%H:%M')}-{close_t.strftime('%H:%M')} (magyar idő)"
-    extra = "\nSwing: napokig/hetekig tartó pozíció, a stop és a cél szélesebb." if mode["name"] == "SWING" else ""
+        candle = f"Lezárt gyertya: {open_t.strftime('%H:%M')} – {close_t.strftime('%H:%M')} (magyar idő)"
+    msg = (f"{icon} <b>{esc(name)}</b> · {side}\n"
+           f"<i>{esc(mode['name'].capitalize())} · {tfc['label']}</i>\n\n"
+           f"<b>Jelek ({len(s['reasons'])}):</b> {esc(', '.join(s['reasons']))}\n"
+           f"<b>Trend ({tfc['label']}):</b> {trend_line}\n"
+           f"<b>Idősíkok:</b> {ctx_text} ({ok}/{len(mode['context'])} egyezik)\n"
+           + levels_text(s) +
+           f"\n<b>Ügylet terv</b>\n"
+           f"  Belépő: ~ {s['entry']:.5g}\n"
+           f"  Aktuális ár: ~ {s['cur']:.5g}\n"
+           f"  Stop: ~ {s['stop']:.5g}\n"
+           f"  Cél: ~ {s['target']:.5g} (1:{mode['rr']:g})\n\n"
+           f"🕒 {candle}")
+    if s["notes"]:
+        msg += f"\nMegjegyzés: {esc(', '.join(s['notes']))}"
+    if mode["name"] == "SWING":
+        msg += "\n📌 Swing: napokig/hetekig tartó pozíció, a stop és a cél szélesebb."
     if s.get("blocker"):
-        extra += f"\nFIGYELEM: {'ellenállás' if s['side'] == 'bull' else 'támasz'} a cél előtt ({s['blocker'][0]:.5g}, {s['blocker'][1]}x), a cél nehezebben érhető el."
-    return (f"{name} [{mode['name']} {tfc['label']}] - {side}\n"
-            f"Jelek ({len(s['reasons'])}): " + ", ".join(s["reasons"]) + "\n"
-            f"Trend ({tfc['label']}): {trend_line}\n"
-            f"Idősíkok: {ctx_text} -> {ok}/{len(mode['context'])} egyezik\n"
-            + levels_text(s) +
-            f"Belépő ~ {s['entry']:.5g}\n"
-            f"Aktuális ár ~ {s['cur']:.5g}\n"
-            f"Stop ~ {s['stop']:.5g}\n"
-            f"Cél ~ {s['target']:.5g} (1:{mode['rr']:g})\n"
-            + candle
-            + (f"\nMegjegyzés: {', '.join(s['notes'])}" if s["notes"] else "")
-            + extra + late +
-            "\nEz csak jelzés, nem tanács. Ellenőrizd a grafikont az XTB-ben!")
+        msg += (f"\n⚠️ <b>Figyelem:</b> {'ellenállás' if s['side'] == 'bull' else 'támasz'} a cél előtt "
+                f"({s['blocker'][0]:.5g}, {s['blocker'][1]}x), a cél nehezebben érhető el.")
+    if abs(s["dist_atr"]) > 0.5:
+        msg += "\n⚠️ <b>Figyelem:</b> az ár már messze van a belépőtől, valószínűleg elkésett."
+    return msg + "\n\n<i>Ez csak jelzés, nem tanács. Ellenőrizd a grafikont az XTB-ben!</i>"
 
 
 def fetch_raw(ticker, yf_interval, period):
@@ -559,15 +580,15 @@ def overview(now):
     if t is not None and (now - t).total_seconds() < OVERVIEW_EVERY_MIN * 60:
         return
     state["overview_t"] = now
-    lines = []
+    blocks = []
     for n in SYMBOLS:
         if n not in last_info:
             continue
         rsi, price, stale = last_info[n]
-        arrows = " ".join(f"{TF[k]['label']}{ARROW.get(ctx.get(f'{n}|{k}'), '?')}" for k in TF_ORDER)
-        lines.append(f"{n}: {arrows} | RSI {rsi:.0f} | ár ~ {price:.5g}" + (" (zárva)" if stale else ""))
-    telegram(f"Állapot ({loc(now).strftime('%H:%M')}):\n" + "\n".join(lines)
-             + "\n(↑ emelkedő, ↓ csökkenő, → vegyes. Az RSI az M15-ös. Belépőt csak külön jelzés ad.)")
+        arrows = "  ".join(f"{TF[k]['label']}{ARROW.get(ctx.get(f'{n}|{k}'), '?')}" for k in TF_ORDER)
+        blocks.append(f"<b>{esc(n)}</b>" + (" (zárva)" if stale else "") + f"\n  {arrows}\n  RSI {rsi:.0f} · ár ~ {price:.5g}")
+    telegram(f"📋 <b>Állapot</b> ({loc(now).strftime('%H:%M')})\n\n" + "\n\n".join(blocks)
+             + "\n\n<i>↑ emelkedő · ↓ csökkenő · → vegyes. Az RSI az M15-ös. Belépőt csak külön jelzés ad.</i>")
 
 
 HU_DAYS = ["Hétfő", "Kedd", "Szerda", "Csütörtök", "Péntek", "Szombat", "Vasárnap"]
@@ -576,45 +597,120 @@ HU_DAYS = ["Hétfő", "Kedd", "Szerda", "Csütörtök", "Péntek", "Szombat", "V
 def send_long(text):
     while text:
         chunk = text[:3500]
-        if len(text) > 3500 and "\n" in chunk:
-            chunk = chunk[:chunk.rfind("\n")]
+        if len(text) > 3500:
+            cut = chunk.rfind("\n\n")
+            if cut <= 0:
+                cut = chunk.rfind("\n")
+            if cut > 0:
+                chunk = chunk[:cut]
         telegram(chunk)
         text = text[len(chunk):].lstrip("\n")
 
 
-def outlook_line(name, ticker, now):
+def completed_trend(df, days, now):
+    """Trend a legutóbbi LEZÁRT gyertyán; az még alakuló gyertyát eldobja."""
+    if df is None or df.empty or len(df) < 30:
+        return None, df
+    if not df.index[-1] + pd.Timedelta(days=days) <= now:
+        df = df.iloc[:-1]
+    return ctx_trend(df, True), df
+
+
+def outlook_data(name, ticker, now):
     w = fetch_raw(ticker, "1wk", "5y")
     d = fetch_raw(ticker, "1d", "1y")
+    m = fetch_raw(ticker, "1mo", "max")
     if w.empty or d.empty or len(w) < 30 or len(d) < 30:
         return None
-    if not w.index[-1] + pd.Timedelta(days=4) <= now:      # még alakuló heti gyertya -> el
-        w = w.iloc[:-1]
-    if not d.index[-1] + pd.Timedelta(days=1) <= now:
-        d = d.iloc[:-1]
-    wt, dtr = ctx_trend(w, True), ctx_trend(d, True)
+    wt, w = completed_trend(w, 4, now)
+    dtr, d = completed_trend(d, 1, now)
+    mt, m = completed_trend(m, 27, now)
     last, prev = w.iloc[-1], w.iloc[-2]
-    chg = (last.Close / prev.Close - 1) * 100
-    rsi = float(add_indicators(d).dropna().iloc[-1].rsi)
+    di = add_indicators(d).dropna()
+    dl = di.iloc[-1]
+    rsi, atr_d, ema21_d, px = float(dl.rsi), float(dl.atr), float(dl.ema21), float(dl.Close)
     atr_w = float(add_indicators(w).dropna().iloc[-1].atr)
-    if wt == dtr == "bull":
+    lv = find_levels(d, atr_d, 250)
+    sup = sorted([x for x in lv if x[0] < px], key=lambda x: -x[0])[:2]
+    res = sorted([x for x in lv if x[0] > px], key=lambda x: x[0])[:2]
+    trends = (mt, wt, dtr)
+    side = None
+    for sd, opp in (("bull", "bear"), ("bear", "bull")):
+        if sum(t == sd for t in trends) >= 2 and wt != opp and dtr != opp:
+            side = sd
+    votes = sum(t == side for t in trends) if side else 0
+    zones = []
+    if side:
+        if abs(px - ema21_d) <= atr_d:
+            zones.append(f"D1 EMA21 közelében ({ema21_d:.5g})")
+        legs = fib_legs(d, atr_d, 120)
+        if side in legs:
+            ret, _ = fib_levels(side, *legs[side])
+            lo_, hi_ = sorted((ret[0.382], ret[0.618]))
+            if lo_ - 0.25 * atr_d <= px <= hi_ + 0.25 * atr_d:
+                zones.append(f"Fibonacci zóna ({lo_:.5g} – {hi_:.5g})")
+        if side == "bull":
+            near = [p for p, n in lv if 0 <= px - p <= atr_d]
+            if near:
+                zones.append(f"támasz közelében ({max(near):.5g})")
+        else:
+            near = [p for p, n in lv if 0 <= p - px <= atr_d]
+            if near:
+                zones.append(f"ellenállás közelében ({min(near):.5g})")
+    rsi_ok = (40 <= rsi <= 65) if side == "bull" else ((35 <= rsi <= 60) if side == "bear" else False)
+    score = votes + len(zones) + (1 if rsi_ok else 0)
+    risk = 2 * atr_d
+    return {"name": name, "mt": mt, "wt": wt, "dt": dtr, "rsi": rsi, "px": px, "ema21": ema21_d,
+            "chg": (last.Close / prev.Close - 1) * 100, "high": float(last.High), "low": float(last.Low),
+            "close": float(last.Close), "atr_w": atr_w, "sup": sup, "res": res,
+            "side": side, "votes": votes, "zones": zones, "score": score,
+            "stop": px - risk if side == "bull" else px + risk,
+            "target": px + 3 * risk if side == "bull" else px - 3 * risk}
+
+
+def outlook_block(x):
+    A = lambda t: ARROW.get(t, "?")
+    if x["wt"] == x["dt"] == "bull":
         bias = "LONG oldalra dől"
-    elif wt == dtr == "bear":
+    elif x["wt"] == x["dt"] == "bear":
         bias = "SHORT oldalra dől"
     else:
         bias = "vegyes, nincs tiszta irány"
-    atr_d = float(add_indicators(d).dropna().iloc[-1].atr)
-    lv = find_levels(d, atr_d, 250)
-    px = float(d.Close.iloc[-1])
-    sup = sorted([x for x in lv if x[0] < px], key=lambda x: -x[0])[:2]
-    res = sorted([x for x in lv if x[0] > px], key=lambda x: x[0])[:2]
-    lv_txt = ""
-    if sup or res:
-        lv_txt = ("\n  D1 szintek: " + " | ".join(filter(None, [
-            ("támasz " + ", ".join(f"{p:.5g} ({n}x)" for p, n in sup)) if sup else "",
-            ("ellenállás " + ", ".join(f"{p:.5g} ({n}x)" for p, n in res)) if res else ""])))
-    return (f"{name}: W1{ARROW.get(wt, '?')} D1{ARROW.get(dtr, '?')} | {bias}\n"
-            f"  RSI(D1) {rsi:.0f} | múlt hét {chg:+.1f}% | H {last.High:.5g} L {last.Low:.5g} Z {last.Close:.5g} | heti ATR {atr_w:.4g}"
-            + lv_txt)
+    t = (f"<b>{esc(x['name'])}</b> · {bias}\n"
+         f"  Trend: MN{A(x['mt'])} · W1{A(x['wt'])} · D1{A(x['dt'])}\n"
+         f"  RSI (D1): {x['rsi']:.0f} · múlt hét: {x['chg']:+.1f}%\n"
+         f"  Múlt heti csúcs: {x['high']:.5g} · mélypont: {x['low']:.5g} · zárás: {x['close']:.5g}\n"
+         f"  Átlagos heti mozgás (ATR): {x['atr_w']:.4g}")
+    if x["sup"]:
+        t += "\n  D1 támasz: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in x["sup"])
+    if x["res"]:
+        t += "\n  D1 ellenállás: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in x["res"])
+    return t
+
+
+def swing_watchlist(datas):
+    cands = sorted([x for x in datas if x["side"] and x["zones"]], key=lambda x: -x["score"])
+    wait = [x for x in datas if x["side"] and not x["zones"]]
+    none = [x for x in datas if not x["side"]]
+    icon = lambda x: "🟢" if x["side"] == "bull" else "🔴"
+    sd = lambda x: "LONG" if x["side"] == "bull" else "SHORT"
+    t = "🎯 <b>Heti swing figyelőlista</b>\n<i>Trendben van, és visszahúzási zónában áll. A konkrét belépőt hét közben a H4 jelzés adja.</i>\n"
+    if cands:
+        for i, x in enumerate(cands, 1):
+            t += (f"\n{i}. {icon(x)} <b>{esc(x['name'])}</b> · {sd(x)} · pontszám {x['score']}\n"
+                  f"   Idősíkok: MN{ARROW.get(x['mt'], '?')} W1{ARROW.get(x['wt'], '?')} D1{ARROW.get(x['dt'], '?')} ({x['votes']}/3 egyezik)\n"
+                  f"   Zóna: {esc(', '.join(x['zones']))}\n"
+                  f"   RSI (D1): {x['rsi']:.0f}\n"
+                  f"   Tájékoztató: stop ~ {x['stop']:.5g} · cél ~ {x['target']:.5g} (1:3)\n")
+    else:
+        t += "\nNincs ilyen jelölt a héten.\n"
+    if wait:
+        t += "\n⏳ <b>Trendben, visszahúzásra vár</b>\n"
+        for x in wait:
+            t += f" • {icon(x)} {esc(x['name'])} · {sd(x)} · figyeld a D1 EMA21-et: ~ {x['ema21']:.5g}\n"
+    if none:
+        t += "\n⛔ <b>Nincs tiszta swing-irány:</b> " + esc(", ".join(x["name"] for x in none)) + "\n"
+    return t
 
 
 def weekly_outlook(now):
@@ -627,34 +723,33 @@ def weekly_outlook(now):
         events = load_calendar()
         end = lt.date() + dt.timedelta(days=5)
         evs = sorted([e for e in events if e["time"] > now and loc(e["time"]).date() <= end], key=lambda x: x["time"])
-        lines, cur_day, counts = [], None, {}
-        for e in evs:
-            ld = loc(e["time"])
-            if ld.date() != cur_day:
-                cur_day = ld.date()
-                lines.append(f"\n{HU_DAYS[ld.weekday()]} ({ld.strftime('%m.%d')}):")
-            lines.append(f"  {ld.strftime('%H:%M')} {e['cur']} {e['title']}"
-                         + (f" (várt: {e['fc']}, előző: {e['prev']})" if e["fc"] or e["prev"] else ""))
-            counts[e["cur"]] = counts.get(e["cur"], 0) + 1
-        head = "Jövő heti fontos gazdasági hírek (magyar idő):"
+        lines, counts = ["📅 <b>Jövő heti fontos gazdasági hírek</b> (magyar idő)"], {}
         if not evs:
-            head += "\nNem találtam eseményt a naptár-feedben (lehet, hogy még nem frissült)."
+            lines.append("\nNem találtam eseményt a naptár-feedben (lehet, hogy még nem frissült).")
+        for day in sorted({loc(e["time"]).date() for e in evs}):
+            de = [e for e in evs if loc(e["time"]).date() == day]
+            lines.append(f"\n<b>{HU_DAYS[day.weekday()]}</b> ({day.strftime('%m.%d.')})")
+            lines += event_lines(de)
+            for e in de:
+                counts[e["cur"]] = counts.get(e["cur"], 0) + 1
         if counts:
             top = sorted(counts.items(), key=lambda x: -x[1])[:3]
-            lines.append("\nLegtöbb hír: " + ", ".join(f"{c} ({n})" for c, n in top))
-        send_long(head + "\n".join(lines))
-    out = []
+            lines.append("\n<i>Legtöbb hír: " + ", ".join(f"{esc(c)} ({n})" for c, n in top) + "</i>")
+        send_long("\n".join(lines))
+    datas = []
     for name, ticker in SYMBOLS.items():
         try:
-            line = outlook_line(name, ticker, now)
-            if line:
-                out.append(line)
+            x = outlook_data(name, ticker, now)
+            if x:
+                datas.append(x)
         except Exception as ex:
             print(name, "heti kép hiba:", ex)
-    if out:
-        send_long("Heti kép piacnyitás előtt (heti és napi trend):\n" + "\n".join(out)
-                  + "\n(↑ emelkedő, ↓ csökkenő, → vegyes. H/L/Z = múlt heti csúcs/mélypont/zárás. A heti ATR az átlagos heti mozgás.)"
-                  + "\nForex és arany kb. 23:00-kor nyit (magyar idő), a normál jelzések ekkortól indulnak. Hétfőn 7:00 után jön a napi hírösszefoglaló.")
+    if datas:
+        telegram(swing_watchlist(datas))
+        send_long("📊 <b>Heti kép piacnyitás előtt</b>\n\n" + "\n\n".join(outlook_block(x) for x in datas)
+                  + "\n\n<i>↑ emelkedő · ↓ csökkenő · → vegyes. Az átlagos heti mozgás a 14 hetes ATR."
+                  + " Forex és arany kb. 23:00-kor nyit (magyar idő), a normál jelzések ekkortól indulnak."
+                  + " Hétfőn 7:00 után jön a napi hírösszefoglaló.</i>")
 
 
 def run_once(now=None):
