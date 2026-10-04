@@ -28,13 +28,18 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "IDE_A_BOT_TOKEN")      # @Bot
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "IDE_A_CHAT_ID")    # @userinfobot adja
 STATE_FILE = "state.json"
 
-SYMBOLS = {                              # név -> Yahoo ticker
+SYMBOLS = {                              # név -> Yahoo ticker (az üzenetekben is ebben a sorrendben)
     "ARANY": "GC=F",
     "EZUST": "SI=F",
     "US100": "^NDX",
     "GER40": "^GDAXI",
+    "BTC": "BTC-USD",
+    "USD INDEX": "DX-Y.NYB",
+    "OLAJ": "CL=F",
     "MODERNA": "MRNA",
     "APPLE": "AAPL",
+    "INTEL": "INTC",
+    "NVIDIA": "NVDA",
     "USDHUF": "HUF=X",
     "EURHUF": "EURHUF=X",
 }
@@ -74,9 +79,10 @@ WARN_BEFORE_MIN = 30            # ennyivel előre figyelmeztet
 BRIEF_HOUR = 7                  # napi összefoglaló ekkortól (magyar idő)
 CUR_SYMBOLS = {"EUR": ["GER40", "EURHUF"], "HUF": ["USDHUF", "EURHUF"]}   # USD mindent érint
 OVERVIEW_EVERY_MIN = 60         # óránként állapotjelentés minden eszközről (0 = ki)
-SKIP_SATURDAY = True            # szombaton nincs üzenet
+SKIP_SATURDAY = True            # szombaton nincs üzenet (a WEEKEND_SYMBOLS kivételével)
+WEEKEND_SYMBOLS = ["BTC"]       # ezekre hétvégén (szombat, vasárnap a nyitásig) is jön jelzés
 SUNDAY_OUTLOOK_HOUR = 18        # vasárnap ekkortól (magyar idő) jön a heti kép és a jövő heti naptár
-SUNDAY_RESUME_HOUR = 23         # vasárnap ekkortól (forex/arany nyitás) indul a normál működés
+SUNDAY_RESUME_HOUR = 21         # vasárnap ekkortól indul a normál működés (a forex/arany kb. 23:00-kor nyit)
 NEWS_BLACKOUT = []              # kézi sáv (UTC), pl. [("2026-10-02 12:00", "2026-10-02 13:15")]
 # =========================
 
@@ -87,6 +93,12 @@ last_info = {}
 fetched = {}
 ctx = {}
 cal_cache = {"t": None, "events": []}
+
+
+def fp(x):
+    """Ár szépen: 5 értékes jegy, de nagy számoknál (pl. BTC) egész szám szóközzel."""
+    x = float(x)
+    return format(x, ".5g") if abs(x) < 99999.5 else f"{x:,.0f}".replace(",", " ")
 
 
 def esc(x):
@@ -498,15 +510,15 @@ def levels_text(s):
     if s["sup"] or s["res"]:
         t += "\n<b>Szintek</b>\n"
         if s["sup"]:
-            t += "  Támasz: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in s["sup"]) + "\n"
+            t += "  Támasz: " + ", ".join(f"{fp(p)} ({n}x)" for p, n in s["sup"]) + "\n"
         if s["res"]:
-            t += "  Ellenállás: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in s["res"]) + "\n"
+            t += "  Ellenállás: " + ", ".join(f"{fp(p)} ({n}x)" for p, n in s["res"]) + "\n"
     f = s.get("fib")
     if f:
         r = f["ret"]
-        t += (f"\n<b>Fibonacci</b> (hullám: {f['low']:.5g} – {f['high']:.5g})\n"
-              f"  38.2%: {r[0.382]:.5g} · 50%: {r[0.5]:.5g} · 61.8%: {r[0.618]:.5g}\n"
-              f"  Cél (1.272): {f['ext'][1.272]:.5g}\n")
+        t += (f"\n<b>Fibonacci</b> (hullám: {fp(f['low'])} – {fp(f['high'])})\n"
+              f"  38.2%: {fp(r[0.382])} · 50%: {fp(r[0.5])} · 61.8%: {fp(r[0.618])}\n"
+              f"  Cél (1.272): {fp(f['ext'][1.272])}\n")
     return t
 
 
@@ -527,10 +539,10 @@ def format_msg(name, s, mode, tfc, ctx_text, ok):
            f"<b>Idősíkok:</b> {ctx_text} ({ok}/{len(mode['context'])} egyezik)\n"
            + levels_text(s) +
            f"\n<b>Ügylet terv</b>\n"
-           f"  Belépő: ~ {s['entry']:.5g}\n"
-           f"  Aktuális ár: ~ {s['cur']:.5g}\n"
-           f"  Stop: ~ {s['stop']:.5g}\n"
-           f"  Cél: ~ {s['target']:.5g} (1:{mode['rr']:g})\n\n"
+           f"  Belépő: ~ {fp(s['entry'])}\n"
+           f"  Aktuális ár: ~ {fp(s['cur'])}\n"
+           f"  Stop: ~ {fp(s['stop'])}\n"
+           f"  Cél: ~ {fp(s['target'])} (1:{mode['rr']:g})\n\n"
            f"🕒 {candle}")
     if s["notes"]:
         msg += f"\nMegjegyzés: {esc(', '.join(s['notes']))}"
@@ -538,7 +550,7 @@ def format_msg(name, s, mode, tfc, ctx_text, ok):
         msg += "\n📌 Swing: napokig/hetekig tartó pozíció, a stop és a cél szélesebb."
     if s.get("blocker"):
         msg += (f"\n⚠️ <b>Figyelem:</b> {'ellenállás' if s['side'] == 'bull' else 'támasz'} a cél előtt "
-                f"({s['blocker'][0]:.5g}, {s['blocker'][1]}x), a cél nehezebben érhető el.")
+                f"({fp(s['blocker'][0])}, {s['blocker'][1]}x), a cél nehezebben érhető el.")
     if abs(s["dist_atr"]) > 0.5:
         msg += "\n⚠️ <b>Figyelem:</b> az ár már messze van a belépőtől, valószínűleg elkésett."
     return msg + "\n\n<i>Ez csak jelzés, nem tanács. Ellenőrizd a grafikont az XTB-ben!</i>"
@@ -586,8 +598,8 @@ def overview(now):
             continue
         rsi, price, stale = last_info[n]
         arrows = "  ".join(f"{TF[k]['label']}{ARROW.get(ctx.get(f'{n}|{k}'), '?')}" for k in TF_ORDER)
-        blocks.append(f"<b>{esc(n)}</b>" + (" (zárva)" if stale else "") + f"\n  {arrows}\n  RSI {rsi:.0f} · ár ~ {price:.5g}")
-    telegram(f"📋 <b>Állapot</b> ({loc(now).strftime('%H:%M')})\n\n" + "\n\n".join(blocks)
+        blocks.append(f"<b>{esc(n)}</b>" + (" (zárva)" if stale else "") + f"\n  {arrows}\n  RSI {rsi:.0f} · ár ~ {fp(price)}")
+    send_long(f"📋 <b>Állapot</b> ({loc(now).strftime('%H:%M')})\n\n" + "\n\n".join(blocks)
              + "\n\n<i>↑ emelkedő · ↓ csökkenő · → vegyes. Az RSI az M15-ös. Belépőt csak külön jelzés ad.</i>")
 
 
@@ -642,21 +654,21 @@ def outlook_data(name, ticker, now):
     zones = []
     if side:
         if abs(px - ema21_d) <= atr_d:
-            zones.append(f"D1 EMA21 közelében ({ema21_d:.5g})")
+            zones.append(f"D1 EMA21 közelében ({fp(ema21_d)})")
         legs = fib_legs(d, atr_d, 120)
         if side in legs:
             ret, _ = fib_levels(side, *legs[side])
             lo_, hi_ = sorted((ret[0.382], ret[0.618]))
             if lo_ - 0.25 * atr_d <= px <= hi_ + 0.25 * atr_d:
-                zones.append(f"Fibonacci zóna ({lo_:.5g} – {hi_:.5g})")
+                zones.append(f"Fibonacci zóna ({fp(lo_)} – {fp(hi_)})")
         if side == "bull":
             near = [p for p, n in lv if 0 <= px - p <= atr_d]
             if near:
-                zones.append(f"támasz közelében ({max(near):.5g})")
+                zones.append(f"támasz közelében ({fp(max(near))})")
         else:
             near = [p for p, n in lv if 0 <= p - px <= atr_d]
             if near:
-                zones.append(f"ellenállás közelében ({min(near):.5g})")
+                zones.append(f"ellenállás közelében ({fp(min(near))})")
     rsi_ok = (40 <= rsi <= 65) if side == "bull" else ((35 <= rsi <= 60) if side == "bear" else False)
     score = votes + len(zones) + (1 if rsi_ok else 0)
     risk = 2 * atr_d
@@ -679,12 +691,12 @@ def outlook_block(x):
     t = (f"<b>{esc(x['name'])}</b> · {bias}\n"
          f"  Trend: MN{A(x['mt'])} · W1{A(x['wt'])} · D1{A(x['dt'])}\n"
          f"  RSI (D1): {x['rsi']:.0f} · múlt hét: {x['chg']:+.1f}%\n"
-         f"  Múlt heti csúcs: {x['high']:.5g} · mélypont: {x['low']:.5g} · zárás: {x['close']:.5g}\n"
-         f"  Átlagos heti mozgás (ATR): {x['atr_w']:.4g}")
+         f"  Múlt heti csúcs: {fp(x['high'])} · mélypont: {fp(x['low'])} · zárás: {fp(x['close'])}\n"
+         f"  Átlagos heti mozgás (ATR): {fp(x['atr_w'])}")
     if x["sup"]:
-        t += "\n  D1 támasz: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in x["sup"])
+        t += "\n  D1 támasz: " + ", ".join(f"{fp(p)} ({n}x)" for p, n in x["sup"])
     if x["res"]:
-        t += "\n  D1 ellenállás: " + ", ".join(f"{p:.5g} ({n}x)" for p, n in x["res"])
+        t += "\n  D1 ellenállás: " + ", ".join(f"{fp(p)} ({n}x)" for p, n in x["res"])
     return t
 
 
@@ -701,13 +713,13 @@ def swing_watchlist(datas):
                   f"   Idősíkok: MN{ARROW.get(x['mt'], '?')} W1{ARROW.get(x['wt'], '?')} D1{ARROW.get(x['dt'], '?')} ({x['votes']}/3 egyezik)\n"
                   f"   Zóna: {esc(', '.join(x['zones']))}\n"
                   f"   RSI (D1): {x['rsi']:.0f}\n"
-                  f"   Tájékoztató: stop ~ {x['stop']:.5g} · cél ~ {x['target']:.5g} (1:3)\n")
+                  f"   Tájékoztató: stop ~ {fp(x['stop'])} · cél ~ {fp(x['target'])} (1:3)\n")
     else:
         t += "\nNincs ilyen jelölt a héten.\n"
     if wait:
         t += "\n⏳ <b>Trendben, visszahúzásra vár</b>\n"
         for x in wait:
-            t += f" • {icon(x)} {esc(x['name'])} · {sd(x)} · figyeld a D1 EMA21-et: ~ {x['ema21']:.5g}\n"
+            t += f" • {icon(x)} {esc(x['name'])} · {sd(x)} · figyeld a D1 EMA21-et: ~ {fp(x['ema21'])}\n"
     if none:
         t += "\n⛔ <b>Nincs tiszta swing-irány:</b> " + esc(", ".join(x["name"] for x in none)) + "\n"
     return t
@@ -745,7 +757,7 @@ def weekly_outlook(now):
         except Exception as ex:
             print(name, "heti kép hiba:", ex)
     if datas:
-        telegram(swing_watchlist(datas))
+        send_long(swing_watchlist(datas))
         send_long("📊 <b>Heti kép piacnyitás előtt</b>\n\n" + "\n\n".join(outlook_block(x) for x in datas)
                   + "\n\n<i>↑ emelkedő · ↓ csökkenő · → vegyes. Az átlagos heti mozgás a 14 hetes ATR."
                   + " Forex és arany kb. 23:00-kor nyit (magyar idő), a normál jelzések ekkortól indulnak."
@@ -755,21 +767,26 @@ def weekly_outlook(now):
 def run_once(now=None):
     now = now if now is not None else pd.Timestamp.now(tz="UTC")
     lt = loc(now)
+    silent = False                    # hétvégi csend: csak a WEEKEND_SYMBOLS jelezhet
     if SKIP_SATURDAY and lt.weekday() == 5:
-        print("szombat: nincs jelzés")
-        return
+        silent = True
     if lt.weekday() == 6:
         weekly_outlook(now)
         if lt.hour < SUNDAY_RESUME_HOUR:
-            return
-    calendar_messages(now)
+            silent = True
+    if silent and not WEEKEND_SYMBOLS:
+        print("hétvégi csend")
+        return
+    if not silent:
+        calendar_messages(now)
+    active = {n: t for n, t in SYMBOLS.items() if not silent or n in WEEKEND_SYMBOLS}
     modes = [m for m in MODES if USE_SWING or m["name"] != "SWING"]
     needed = set()
     for m in modes:
         needed.add(m["entry"])
         needed.update(m["context"])
     order = [k for k in TF_ORDER if k in needed]
-    for name, ticker in SYMBOLS.items():
+    for name, ticker in active.items():
         try:
             raw, frames = {}, {}
             for tfk in order:                                  # fentről lefelé: előbb a kontextus
@@ -818,7 +835,8 @@ def run_once(now=None):
                     telegram(msg)
         except Exception as ex:
             print(name, "hiba:", ex)
-    overview(now)
+    if not silent:
+        overview(now)
 
 
 def load_state():
