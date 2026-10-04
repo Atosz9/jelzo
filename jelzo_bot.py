@@ -75,7 +75,7 @@ BRIEF_HOUR = 7                  # napi összefoglaló ekkortól (magyar idő)
 CUR_SYMBOLS = {"EUR": ["GER40", "EURHUF"], "HUF": ["USDHUF", "EURHUF"]}   # USD mindent érint
 OVERVIEW_EVERY_MIN = 60         # óránként állapotjelentés minden eszközről (0 = ki)
 SKIP_SATURDAY = True            # szombaton nincs üzenet
-SUNDAY_OUTLOOK_HOUR = 0        # vasárnap ekkortól (magyar idő) jön a heti kép és a jövő heti naptár
+SUNDAY_OUTLOOK_HOUR = 18        # vasárnap ekkortól (magyar idő) jön a heti kép és a jövő heti naptár
 SUNDAY_RESUME_HOUR = 23         # vasárnap ekkortól (forex/arany nyitás) indul a normál működés
 NEWS_BLACKOUT = []              # kézi sáv (UTC), pl. [("2026-10-02 12:00", "2026-10-02 13:15")]
 # =========================
