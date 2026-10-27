@@ -37,6 +37,7 @@ SYMBOLS = {                              # név -> Yahoo ticker (az üzenetekben
     "BTC": "BTC-USD",
     "USD INDEX": "DX-Y.NYB",
     "OLAJ": "CL=F",
+    "NATGAS": "NG=F",
     "MODERNA": "MRNA",
     "APPLE": "AAPL",
     "INTEL": "INTC",
@@ -1523,6 +1524,9 @@ def run_once(now=None):
                     key = f"{name}|{mode['name']}|{e}|{s['candle']}|{s['side']}"
                     if key in sent:
                         continue
+                    if any(x["name"] == name and x["mode"] == mode["name"] and x["side"] == s["side"] and x["status"] == "open"
+                           for x in signals):
+                        continue                               # amíg az előző ugyanilyen jelzés nyitott, nem küld újat (ugyanaz az ötlet)
                     ck = f"{name}|{mode['name']}|{s['side']}"
                     cd = mode.get("cooldown_min", 0)
                     if cd and ck in cool and (now - pd.Timestamp(cool[ck])).total_seconds() / 60 < cd:
